@@ -4,7 +4,7 @@ description: |-
   Get a VM instance within GCE.
 ---
 
-# google\_compute\_instance
+# google_compute_instance
 
 Get information about a VM instance resource within GCE. For more information see
 [the official documentation](https://cloud.google.com/compute/docs/instances)
@@ -87,7 +87,7 @@ The following arguments are supported:
 
 * `enable_display` - Whether the instance has virtual displays enabled.
 
-* `current_status` - The current status of the instance. This could be one of the following values: PROVISIONING, STAGING, RUNNING, STOPPING, SUSPENDING, SUSPENDED, REPAIRING, and TERMINATED. For more information about the status of the instance, see [Instance life cycle](https://cloud.google.com/compute/docs/instances/instance-life-cycle).`,
+* `current_status` - The current status of the instance. This could be one of the following values: PROVISIONING, STAGING, RUNNING, STOPPING, SUSPENDING, SUSPENDED, REPAIRING, and TERMINATED. For more information about the status of the instance, see [Instance life cycle](https://cloud.google.com/compute/docs/instances/instance-life-cycle).
 
 * `network_interface.0.network_ip` - The internal ip address of the instance, either manually or dynamically assigned.
 
@@ -131,6 +131,8 @@ The following arguments are supported:
 
 * `labels` - A set of key/value label pairs assigned to the disk.
 
+* `resource_policies` - A list of self_links to resource policies attached to the selected `boot_disk`
+
 <a name="nested_scratch_disk"></a>The `scratch_disk` block supports:
 
 * `interface` - The disk interface used for attaching this disk. One of `SCSI` or `NVME`.
@@ -159,6 +161,8 @@ The following arguments are supported:
 
 * `alias_ip_range` - An array of alias IP ranges for this network interface. Structure [documented below](#nested_alias_ip_range).
 
+* `network_attachment` - [Beta](https://terraform.io/docs/providers/google/guides/provider_versions.html) The URL of the network attachment to this interface.	
+
 <a name="nested_access_config"></a>The `access_config` block supports:
 
 * `nat_ip` - The IP address that is be 1:1 mapped to the instance's
@@ -183,6 +187,8 @@ The following arguments are supported:
 * `scopes` - A list of service scopes.
 
 <a name="nested_scheduling"></a>The `scheduling` block supports:
+
+* `host_error_timeout_seconds` - [Beta](https://terraform.io/docs/providers/google/guides/provider_versions.html) Time in seconds for host error detection.
 
 * `preemptible` - Whether the instance is preemptible.
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -143,13 +144,13 @@ func BootstrapKMSKeyWithPurposeInLocationAndName(t *testing.T, purpose, location
 	}
 }
 
-var serviceAccountEmail = "tf-bootstrap-service-account"
+var serviceAccountPrefix = "tf-bootstrap-sa-"
 var serviceAccountDisplay = "Bootstrapped Service Account for Terraform tests"
 
 // Some tests need a second service account, other than the test runner, to assert functionality on.
 // This provides a well-known service account that can be used when dynamically creating a service
 // account isn't an option.
-func getOrCreateServiceAccount(config *transport_tpg.Config, project string) (*iam.ServiceAccount, error) {
+func getOrCreateServiceAccount(config *transport_tpg.Config, project, serviceAccountEmail string) (*iam.ServiceAccount, error) {
 	name := fmt.Sprintf("projects/%s/serviceAccounts/%s@%s.iam.gserviceaccount.com", project, serviceAccountEmail, project)
 	log.Printf("[DEBUG] Verifying %s as bootstrapped service account.\n", name)
 
@@ -206,13 +207,19 @@ func impersonationServiceAccountPermissions(config *transport_tpg.Config, sa *ia
 	return nil
 }
 
-func BootstrapServiceAccount(t *testing.T, project, testRunner string) string {
+// A separate testId should be used for each test, to create separate service accounts for each,
+// and avoid race conditions where the policy of the same service account is being modified by 2
+// tests at once. This is needed as long as the function overwrites the policy on every run.
+func BootstrapServiceAccount(t *testing.T, testId, testRunner string) string {
+	project := envvar.GetTestProjectFromEnv()
+	serviceAccountEmail := serviceAccountPrefix + testId
+
 	config := BootstrapConfig(t)
 	if config == nil {
 		return ""
 	}
 
-	sa, err := getOrCreateServiceAccount(config, project)
+	sa, err := getOrCreateServiceAccount(config, project, serviceAccountEmail)
 	if err != nil {
 		t.Fatalf("Bootstrapping failed. Cannot retrieve service account, %s", err)
 	}
@@ -387,10 +394,9 @@ const SharedTestGlobalAddressPrefix = "tf-bootstrap-addr-"
 // params are the functions to set compute global address
 func BootstrapSharedTestGlobalAddress(t *testing.T, testId string, params ...func(*AddressSettings)) string {
 	project := envvar.GetTestProjectFromEnv()
-	projectNumber := envvar.GetTestProjectNumberFromEnv()
 	addressName := SharedTestGlobalAddressPrefix + testId
 	networkName := BootstrapSharedTestNetwork(t, testId)
-	networkId := fmt.Sprintf("projects/%v/global/networks/%v", projectNumber, networkName)
+	networkId := fmt.Sprintf("projects/%v/global/networks/%v", project, networkName)
 
 	config := BootstrapConfig(t)
 	if config == nil {
@@ -443,6 +449,35 @@ func BootstrapSharedTestGlobalAddress(t *testing.T, testId string, params ...fun
 	return address.Name
 }
 
+type ServiceNetworkSettings struct {
+	PrefixLength  int
+	ParentService string
+}
+
+func ServiceNetworkWithPrefixLength(prefixLength int) func(*ServiceNetworkSettings) {
+	return func(settings *ServiceNetworkSettings) {
+		settings.PrefixLength = prefixLength
+	}
+}
+
+func ServiceNetworkWithParentService(parentService string) func(*ServiceNetworkSettings) {
+	return func(settings *ServiceNetworkSettings) {
+		settings.ParentService = parentService
+	}
+}
+
+func NewServiceNetworkSettings(options ...func(*ServiceNetworkSettings)) *ServiceNetworkSettings {
+	settings := &ServiceNetworkSettings{
+		PrefixLength:  16,                                 // default prefix length
+		ParentService: "servicenetworking.googleapis.com", // default parent service
+	}
+
+	for _, o := range options {
+		o(settings)
+	}
+	return settings
+}
+
 // BootstrapSharedServiceNetworkingConnection will create a shared network
 // if it hasn't been created in the test project, a global address
 // if it hasn't been created in the test project, and a service networking connection
@@ -461,8 +496,9 @@ func BootstrapSharedTestGlobalAddress(t *testing.T, testId string, params ...fun
 // https://cloud.google.com/vpc/docs/configure-private-services-access#removing-connection
 //
 // testId specifies the test for which a shared network and a gobal address are used/initialized.
-func BootstrapSharedServiceNetworkingConnection(t *testing.T, testId string, params ...func(*AddressSettings)) string {
-	parentService := "services/servicenetworking.googleapis.com"
+func BootstrapSharedServiceNetworkingConnection(t *testing.T, testId string, params ...func(*ServiceNetworkSettings)) string {
+	settings := NewServiceNetworkSettings(params...)
+	parentService := "services/" + settings.ParentService
 	projectId := envvar.GetTestProjectFromEnv()
 
 	config := BootstrapConfig(t)
@@ -479,7 +515,7 @@ func BootstrapSharedServiceNetworkingConnection(t *testing.T, testId string, par
 
 	networkName := SharedTestNetworkPrefix + testId
 	networkId := fmt.Sprintf("projects/%v/global/networks/%v", project.ProjectNumber, networkName)
-	globalAddressName := BootstrapSharedTestGlobalAddress(t, testId, params...)
+	globalAddressName := BootstrapSharedTestGlobalAddress(t, testId, AddressWithPrefixLength(settings.PrefixLength))
 
 	readCall := config.NewServiceNetworkingClient(config.UserAgent).Services.Connections.List(parentService).Network(networkId)
 	if config.UserProjectOverride {
@@ -516,7 +552,7 @@ func BootstrapSharedServiceNetworkingConnection(t *testing.T, testId string, par
 		}
 
 		log.Printf("[DEBUG] Waiting for service networking connection creation to finish")
-		if err := tpgservicenetworking.ServiceNetworkingOperationWaitTime(config, op, "Create Service Networking Connection", config.UserAgent, projectId, 4*time.Minute); err != nil {
+		if err := tpgservicenetworking.ServiceNetworkingOperationWaitTimeHW(config, op, "Create Service Networking Connection", config.UserAgent, projectId, 4*time.Minute); err != nil {
 			t.Fatalf("Error bootstrapping shared test service networking connection: %s", err)
 		}
 	}
@@ -579,65 +615,6 @@ func BootstrapServicePerimeterProjects(t *testing.T, desiredProjects int) []*clo
 	}
 
 	return projects
-}
-
-func RemoveContainerServiceAgentRoleFromContainerEngineRobot(t *testing.T, project *cloudresourcemanager.Project) {
-	config := BootstrapConfig(t)
-	if config == nil {
-		return
-	}
-
-	client := config.NewResourceManagerClient(config.UserAgent)
-	containerEngineRobot := fmt.Sprintf("serviceAccount:service-%d@container-engine-robot.iam.gserviceaccount.com", project.ProjectNumber)
-	getPolicyRequest := &cloudresourcemanager.GetIamPolicyRequest{}
-	policy, err := client.Projects.GetIamPolicy(project.ProjectId, getPolicyRequest).Do()
-	if err != nil {
-		t.Fatalf("error getting project iam policy: %v", err)
-	}
-	roleFound := false
-	changed := false
-	for _, binding := range policy.Bindings {
-		if binding.Role == "roles/container.serviceAgent" {
-			memberFound := false
-			for i, member := range binding.Members {
-				if member == containerEngineRobot {
-					binding.Members[i] = binding.Members[len(binding.Members)-1]
-					memberFound = true
-				}
-			}
-			if memberFound {
-				binding.Members = binding.Members[:len(binding.Members)-1]
-				changed = true
-			}
-		} else if binding.Role == "roles/editor" {
-			memberFound := false
-			for _, member := range binding.Members {
-				if member == containerEngineRobot {
-					memberFound = true
-					break
-				}
-			}
-			if !memberFound {
-				binding.Members = append(binding.Members, containerEngineRobot)
-				changed = true
-			}
-			roleFound = true
-		}
-	}
-	if !roleFound {
-		policy.Bindings = append(policy.Bindings, &cloudresourcemanager.Binding{
-			Members: []string{containerEngineRobot},
-			Role:    "roles/editor",
-		})
-		changed = true
-	}
-	if changed {
-		setPolicyRequest := &cloudresourcemanager.SetIamPolicyRequest{Policy: policy}
-		policy, err = client.Projects.SetIamPolicy(project.ProjectId, setPolicyRequest).Do()
-		if err != nil {
-			t.Fatalf("error setting project iam policy: %v", err)
-		}
-	}
 }
 
 // BootstrapProject will create or get a project named
@@ -934,7 +911,25 @@ func BootstrapSharedCaPoolInLocation(t *testing.T, location string) string {
 	return poolName
 }
 
+func BootstrapSubnetForDataprocBatches(t *testing.T, subnetName string, networkName string) string {
+	subnetOptions := map[string]interface{}{
+		"privateIpGoogleAccess": true,
+	}
+	return BootstrapSubnetWithOverrides(t, subnetName, networkName, subnetOptions)
+}
+
 func BootstrapSubnet(t *testing.T, subnetName string, networkName string) string {
+	return BootstrapSubnetWithOverrides(t, subnetName, networkName, make(map[string]interface{}))
+}
+
+func BootstrapSubnetWithFirewallForDataprocBatches(t *testing.T, testId string, subnetName string) string {
+	networkName := BootstrapSharedTestNetwork(t, testId)
+	subnetworkName := BootstrapSubnetForDataprocBatches(t, subnetName, networkName)
+	BootstrapFirewallForDataprocSharedNetwork(t, subnetName, networkName)
+	return subnetworkName
+}
+
+func BootstrapSubnetWithOverrides(t *testing.T, subnetName string, networkName string, subnetOptions map[string]interface{}) string {
 	projectID := envvar.GetTestProjectFromEnv()
 	region := envvar.GetTestRegionFromEnv()
 
@@ -956,11 +951,15 @@ func BootstrapSubnet(t *testing.T, subnetName string, networkName string) string
 		networkUrl := fmt.Sprintf("%sprojects/%s/global/networks/%s", config.ComputeBasePath, projectID, networkName)
 		url := fmt.Sprintf("%sprojects/%s/regions/%s/subnetworks", config.ComputeBasePath, projectID, region)
 
-		subnetObj := map[string]interface{}{
+		defaultSubnetObj := map[string]interface{}{
 			"name":        subnetName,
 			"region ":     region,
 			"network":     networkUrl,
 			"ipCidrRange": "10.77.0.0/20",
+		}
+
+		if len(subnetOptions) != 0 {
+			maps.Copy(defaultSubnetObj, subnetOptions)
 		}
 
 		res, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
@@ -969,7 +968,7 @@ func BootstrapSubnet(t *testing.T, subnetName string, networkName string) string
 			Project:   projectID,
 			RawURL:    url,
 			UserAgent: config.UserAgent,
-			Body:      subnetObj,
+			Body:      defaultSubnetObj,
 			Timeout:   4 * time.Minute,
 		})
 
@@ -1131,6 +1130,85 @@ func BootstrapFirewallForDataprocSharedNetwork(t *testing.T, firewallName string
 	return firewall.Name
 }
 
+const SharedStoragePoolPrefix = "tf-bootstrap-storage-pool-"
+
+func BootstrapComputeStoragePool(t *testing.T, storagePoolName, storagePoolType string) string {
+	projectID := envvar.GetTestProjectFromEnv()
+	zone := envvar.GetTestZoneFromEnv()
+
+	storagePoolName = SharedStoragePoolPrefix + storagePoolType + "-" + storagePoolName
+
+	config := BootstrapConfig(t)
+	if config == nil {
+		t.Fatal("Could not bootstrap config.")
+	}
+
+	computeService := config.NewComputeClient(config.UserAgent)
+	if computeService == nil {
+		t.Fatal("Could not create compute client.")
+	}
+
+	_, err := computeService.StoragePools.Get(projectID, zone, storagePoolName).Do()
+	if err != nil && transport_tpg.IsGoogleApiErrorWithCode(err, 404) {
+		log.Printf("[DEBUG] Storage pool %q not found, bootstrapping", storagePoolName)
+
+		url := fmt.Sprintf("%sprojects/%s/zones/%s/storagePools", config.ComputeBasePath, projectID, zone)
+		storagePoolTypeUrl := fmt.Sprintf("/projects/%s/zones/%s/storagePoolTypes/%s", projectID, zone, storagePoolType)
+
+		storagePoolObj := map[string]interface{}{
+			"name":                      storagePoolName,
+			"poolProvisionedCapacityGb": 10240,
+			"poolProvisionedThroughput": 180,
+			"storagePoolType":           storagePoolTypeUrl,
+			"capacityProvisioningType":  "ADVANCED",
+		}
+
+		if storagePoolType == "hyperdisk-balanced" {
+			storagePoolObj["poolProvisionedIops"] = 10000
+			storagePoolObj["poolProvisionedThroughput"] = 1024
+		}
+
+		res, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+			Config:    config,
+			Method:    "POST",
+			Project:   projectID,
+			RawURL:    url,
+			UserAgent: config.UserAgent,
+			Body:      storagePoolObj,
+			Timeout:   20 * time.Minute,
+		})
+
+		log.Printf("Response is, %s", res)
+		if err != nil {
+			t.Fatalf("Error bootstrapping storage pool %s: %s", storagePoolName, err)
+		}
+
+		log.Printf("[DEBUG] Waiting for storage pool creation to finish")
+		err = tpgcompute.ComputeOperationWaitTime(config, res, projectID, "Error bootstrapping storage pool", config.UserAgent, 4*time.Minute)
+		if err != nil {
+			t.Fatalf("Error bootstrapping test storage pool %s: %s", storagePoolName, err)
+		}
+	}
+
+	storagePool, err := computeService.StoragePools.Get(projectID, zone, storagePoolName).Do()
+
+	if storagePool == nil {
+		t.Fatalf("Error getting storage pool %s: is nil", storagePoolName)
+	}
+
+	if err != nil {
+		t.Fatalf("Error getting storage pool %s: %s", storagePoolName, err)
+	}
+
+	storagePoolResourceName, err := tpgresource.GetRelativePath(storagePool.SelfLink)
+
+	if err != nil {
+		t.Fatal("Failed to extract Storage Pool resource name from URL.")
+	}
+
+	return storagePoolResourceName
+}
+
 func SetupProjectsAndGetAccessToken(org, billing, pid, service string, config *transport_tpg.Config) (string, error) {
 	// Create project-1 and project-2
 	rmService := config.NewResourceManagerClient(config.UserAgent)
@@ -1258,7 +1336,8 @@ func SetupProjectsAndGetAccessToken(org, billing, pid, service string, config *t
 	}
 
 	// Create a service account for project-1
-	sa1, err := getOrCreateServiceAccount(config, pid)
+	serviceAccountEmail := serviceAccountPrefix + service
+	sa1, err := getOrCreateServiceAccount(config, pid, serviceAccountEmail)
 	if err != nil {
 		return "", err
 	}
@@ -1326,4 +1405,142 @@ func SetupProjectsAndGetAccessToken(org, billing, pid, service string, config *t
 	accessToken := atResp.AccessToken
 
 	return accessToken, nil
+}
+
+const sharedTagKeyPrefix = "tf-bootstrap-tagkey"
+
+func BootstrapSharedTestTagKey(t *testing.T, testId string) string {
+	org := envvar.GetTestOrgFromEnv(t)
+	sharedTagKey := fmt.Sprintf("%s-%s", sharedTagKeyPrefix, testId)
+	tagKeyName := fmt.Sprintf("%s/%s", org, sharedTagKey)
+
+	config := BootstrapConfig(t)
+	if config == nil {
+		return ""
+	}
+
+	log.Printf("[DEBUG] Getting shared test tag key %q", sharedTagKey)
+	getURL := fmt.Sprintf("%stagKeys/namespaced?name=%s", config.TagsBasePath, tagKeyName)
+	_, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+		Config:    config,
+		Method:    "GET",
+		Project:   config.Project,
+		RawURL:    getURL,
+		UserAgent: config.UserAgent,
+		Timeout:   2 * time.Minute,
+	})
+	if err != nil && transport_tpg.IsGoogleApiErrorWithCode(err, 403) {
+		log.Printf("[DEBUG] TagKey %q not found, bootstrapping", sharedTagKey)
+		tagKeyObj := map[string]interface{}{
+			"parent":      "organizations/" + org,
+			"shortName":   sharedTagKey,
+			"description": "Bootstrapped tag key for Terraform Acceptance testing",
+		}
+
+		_, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+			Config:    config,
+			Method:    "POST",
+			Project:   config.Project,
+			RawURL:    config.TagsBasePath + "tagKeys/",
+			UserAgent: config.UserAgent,
+			Body:      tagKeyObj,
+			Timeout:   10 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("Error bootstrapping shared tag key %q: %s", sharedTagKey, err)
+		}
+
+		log.Printf("[DEBUG] Waiting for shared tag key creation to finish")
+	}
+
+	_, err = transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+		Config:    config,
+		Method:    "GET",
+		Project:   config.Project,
+		RawURL:    getURL,
+		UserAgent: config.UserAgent,
+		Timeout:   2 * time.Minute,
+	})
+
+	if err != nil {
+		t.Fatalf("Error getting shared tag key %q: %s", sharedTagKey, err)
+	}
+
+	return sharedTagKey
+}
+
+const sharedTagValuePrefix = "tf-bootstrap-tagvalue"
+
+func BootstrapSharedTestTagValue(t *testing.T, testId string, tagKey string) string {
+	org := envvar.GetTestOrgFromEnv(t)
+	sharedTagValue := fmt.Sprintf("%s-%s", sharedTagValuePrefix, testId)
+	tagKeyName := fmt.Sprintf("%s/%s", org, tagKey)
+	tagValueName := fmt.Sprintf("%s/%s", tagKeyName, sharedTagValue)
+
+	config := BootstrapConfig(t)
+	if config == nil {
+		return ""
+	}
+
+	log.Printf("[DEBUG] Getting shared test tag value %q", sharedTagValue)
+	getURL := fmt.Sprintf("%stagValues/namespaced?name=%s", config.TagsBasePath, tagValueName)
+	_, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+		Config:    config,
+		Method:    "GET",
+		Project:   config.Project,
+		RawURL:    getURL,
+		UserAgent: config.UserAgent,
+		Timeout:   2 * time.Minute,
+	})
+	if err != nil && transport_tpg.IsGoogleApiErrorWithCode(err, 403) {
+		log.Printf("[DEBUG] TagValue %q not found, bootstrapping", sharedTagValue)
+		log.Printf("[DEBUG] Fetching permanent id for tagkey %s", tagKeyName)
+		tagKeyGetURL := fmt.Sprintf("%stagKeys/namespaced?name=%s", config.TagsBasePath, tagKeyName)
+		tagKeyResponse, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+			Config:    config,
+			Method:    "GET",
+			Project:   config.Project,
+			RawURL:    tagKeyGetURL,
+			UserAgent: config.UserAgent,
+			Timeout:   2 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("Error getting tag key id for %s : %s", tagKeyName, err)
+		}
+		tagKeyObj := map[string]interface{}{
+			"parent":      tagKeyResponse["name"].(string),
+			"shortName":   sharedTagValue,
+			"description": "Bootstrapped tag value for Terraform Acceptance testing",
+		}
+
+		_, err = transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+			Config:    config,
+			Method:    "POST",
+			Project:   config.Project,
+			RawURL:    config.TagsBasePath + "tagValues/",
+			UserAgent: config.UserAgent,
+			Body:      tagKeyObj,
+			Timeout:   10 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("Error bootstrapping shared tag value %q: %s", sharedTagValue, err)
+		}
+
+		log.Printf("[DEBUG] Waiting for shared tag value creation to finish")
+	}
+
+	_, err = transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+		Config:    config,
+		Method:    "GET",
+		Project:   config.Project,
+		RawURL:    getURL,
+		UserAgent: config.UserAgent,
+		Timeout:   2 * time.Minute,
+	})
+
+	if err != nil {
+		t.Fatalf("Error getting shared tag value %q: %s", sharedTagValue, err)
+	}
+
+	return sharedTagValue
 }
